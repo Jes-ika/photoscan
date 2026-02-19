@@ -66,13 +66,13 @@ def _cosine_distance(a: "np.ndarray", b: "np.ndarray") -> float:
 
 
 def _opencv_face_locations(image_array: "np.ndarray") -> List[Tuple[int, int, int, int]]:
-    """OpenCV Haar. Returns (top, right, bottom, left). Lower scaleFactor = more faces, slower."""
+    """OpenCV Haar. Returns (top, right, bottom, left). Stricter params to reduce false positives (lights, reflections)."""
     gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
     face_cascade = cv2.CascadeClassifier(
         cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
     )
-    # scaleFactor 1.05, minNeighbors 4 = more sensitive
-    faces = face_cascade.detectMultiScale(gray, 1.05, 4, minSize=(24, 24))
+    # minNeighbors=6, minSize=(48,48) = fewer false positives from streetlights/reflections
+    faces = face_cascade.detectMultiScale(gray, 1.1, 6, minSize=(48, 48))
     return [(int(y), int(x + w), int(y + h), int(x)) for (x, y, w, h) in faces]
 
 
@@ -106,12 +106,22 @@ def _merge_face_locations(
     return merged
 
 
-def _retinaface_to_trbl(resp: dict) -> List[Tuple[int, int, int, int]]:
-    """Convert RetinaFace bbox (x1,y1,x2,y2) to (top, right, bottom, left)."""
+def _filter_small_faces(
+    locations: List[Tuple[int, int, int, int]], min_side: int = 48
+) -> List[Tuple[int, int, int, int]]:
+    """Drop detections smaller than min_side (avoids streetlights, reflections as false faces)."""
+    return [(t, r, b, l) for (t, r, b, l) in locations if (r - l) >= min_side and (b - t) >= min_side]
+
+
+def _retinaface_to_trbl(resp: dict, min_score: float = 0.8) -> List[Tuple[int, int, int, int]]:
+    """Convert RetinaFace bbox (x1,y1,x2,y2) to (top, right, bottom, left). Filter by confidence."""
     locations = []
     if not isinstance(resp, dict):
         return locations
     for _, face in resp.items():
+        score = face.get("score", 0.0)
+        if score < min_score:
+            continue
         box = face.get("facial_area", [])
         if len(box) >= 4:
             x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
@@ -250,7 +260,8 @@ class FaceRecognitionService:
         if OPENCV_AVAILABLE:
             haar_locs = _opencv_face_locations(image_array)
             all_locations.extend(haar_locs)
-        locations = _merge_face_locations(all_locations)[: self.max_faces]
+        locations = _merge_face_locations(all_locations)
+        locations = _filter_small_faces(locations, min_side=48)[: self.max_faces]
         if not locations:
             return []
         encodings = face_recognition.face_encodings(
@@ -269,8 +280,8 @@ class FaceRecognitionService:
         # 2. RetinaFace or InsightFace (best for groups, 15+ people)
         if RETINAFACE_AVAILABLE:
             try:
-                resp = RetinaFace.detect_faces(enhanced)
-                rf_locs = _retinaface_to_trbl(resp)
+                resp = RetinaFace.detect_faces(enhanced, threshold=0.9)
+                rf_locs = _retinaface_to_trbl(resp, min_score=0.85)
                 all_locations.extend(rf_locs)
             except Exception as e:
                 logger.debug("RetinaFace detection failed: %s", e)
@@ -306,7 +317,8 @@ class FaceRecognitionService:
             haar_locs = _opencv_face_locations(enhanced)
             all_locations.extend(haar_locs)
 
-        locations = _merge_face_locations(all_locations, iou_threshold=0.4)[: self.max_faces]
+        locations = _merge_face_locations(all_locations, iou_threshold=0.4)
+        locations = _filter_small_faces(locations, min_side=48)[: self.max_faces]
         if not locations:
             return []
 
@@ -323,15 +335,19 @@ class FaceRecognitionService:
             return self._encode_dlib_ensemble(image_array, num_jitters=10)
         encodings = []
         if RETINAFACE_AVAILABLE:
-            resp = RetinaFace.detect_faces(image_array)
+            resp = RetinaFace.detect_faces(image_array, threshold=0.9)
             if isinstance(resp, dict) and "face_1" in resp:
                 for i, (_, face) in enumerate(resp.items()):
                     if i >= self.max_faces:
                         break
+                    if face.get("score", 0) < 0.85:
+                        continue
                     box = face.get("facial_area", [])
                     if len(box) < 4:
                         continue
                     x1, y1, x2, y2 = max(0, int(box[0])), max(0, int(box[1])), int(box[2]), int(box[3])
+                    if (x2 - x1) < 48 or (y2 - y1) < 48:
+                        continue
                     face_img = image_array[y1:y2, x1:x2]
                     if face_img.size == 0:
                         continue
@@ -391,7 +407,7 @@ class FaceRecognitionService:
 
     def _encode_retinaface(self, image_array: "np.ndarray") -> List[List[float]]:
         """RetinaFace detection + InsightFace ArcFace for embedding, 512-d."""
-        resp = RetinaFace.detect_faces(image_array)
+        resp = RetinaFace.detect_faces(image_array, threshold=0.9)
         if not isinstance(resp, dict) or "face_1" not in resp:
             return []
         app = _get_insightface_app()
@@ -399,10 +415,14 @@ class FaceRecognitionService:
         for i, (_, face) in enumerate(resp.items()):
             if i >= self.max_faces:
                 break
+            if face.get("score", 0) < 0.85:
+                continue
             box = face.get("facial_area", [])
             if len(box) < 4:
                 continue
             x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+            if (x2 - x1) < 48 or (y2 - y1) < 48:
+                continue
             x1, y1 = max(0, x1), max(0, y1)
             face_img = image_array[y1:y2, x1:x2]
             if face_img.size == 0:
